@@ -1,9 +1,7 @@
 import asyncio
-import time
 import os
 import numpy as np
 from deepgram import DeepgramClient
-from pydub import AudioSegment
 import soundfile as sf
 from dotenv import load_dotenv
 
