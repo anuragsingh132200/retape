@@ -1,153 +1,249 @@
+"""
+Streaming Voicemail Dropper
+
+This solution simulates real phone calls by streaming each voicemail audio file
+in fixed 50 ms chunks. A hybrid detection engine runs on each chunk:
+
+1. Beep detection (fast lane): Uses FFT to detect a sustained tone around a
+   configurable frequency band (e.g., 800 Hz +/- tolerance) with a minimum
+   duration and amplitude.
+2. Silence detection (fallback): Computes RMS energy and, after a warmup
+   period, looks for a continuous region of low energy (silence) longer than
+   a configurable threshold.
+
+If a beep is detected, the drop time is set to the moment the beep is
+confirmed. If no beep is found, the system falls back to silence detection
+and triggers after the greeting ends and the caller stops speaking. The engine
+stops at the first trigger and returns the timestamp and trigger reason
+(Beep Detected / Silence Timeout / Fallback). Optionally, the script uses
+Deepgram speech-to-text to annotate the result with a transcript and word
+count for analysis.
+
+A separate Streamlit app (not in this file) uses the same detection logic
+to provide an interactive demo with sliders to tune parameters and visualize
+the waveform, warmup region, and drop point.
+"""
+
 import asyncio
 import os
+import wave
+from io import BytesIO
+
 import numpy as np
-from deepgram import DeepgramClient
 import soundfile as sf
+from deepgram import DeepgramClient
 from dotenv import load_dotenv
 
-# Load environment variables
+# ==========================================
+# 0. CONFIG & ENV
+# ==========================================
+
 load_dotenv()
 
+AUDIO_DIR = "./voicemail_audio_files"
+CHUNK_DURATION_MS = 50  # Simulated streaming chunk size
+DEFAULT_STRATEGY = "combined"  # 'silence', 'beep', or 'combined'
+
+# Silence Strategy defaults
+SILENCE_WARMUP = 2.0        # seconds
+SILENCE_THRESHOLD = 1.5     # seconds of continuous silence
+SILENCE_ENERGY_FLOOR = 500  # RMS threshold (int16 domain)
+
+# Beep Strategy defaults
+BEEP_TARGET_FREQ = 800      # Hz
+BEEP_TOLERANCE = 100        # Hz +/- around target
+BEEP_MIN_DURATION = 0.15    # seconds
+BEEP_MIN_AMP = 2000         # amplitude in FFT magnitudes
+
+# ==========================================
+# 1. STREAMING UTIL
+# ==========================================
+
+def stream_audio_file(filepath, chunk_duration_ms=CHUNK_DURATION_MS):
+    """
+    Generator that simulates live streaming of a WAV file.
+    Yields (audio_chunk: np.ndarray (mono), sample_rate, current_time_sec).
+    """
+    with wave.open(filepath, 'rb') as wf:
+        sample_rate = wf.getframerate()
+        n_channels = wf.getnchannels()
+        chunk_size = int(sample_rate * (chunk_duration_ms / 1000.0))
+        current_time = 0.0
+
+        while True:
+            data = wf.readframes(chunk_size)
+            if len(data) == 0:
+                break
+
+            audio_chunk = np.frombuffer(data, dtype=np.int16)
+            if n_channels > 1:
+                audio_chunk = audio_chunk.reshape(-1, n_channels).mean(axis=1).astype(np.int16)
+
+            if len(audio_chunk) < chunk_size:
+                audio_chunk = np.pad(audio_chunk, (0, chunk_size - len(audio_chunk)))
+
+            yield audio_chunk, sample_rate, current_time
+            current_time += (chunk_duration_ms / 1000.0)
+
+# ==========================================
+# 2. STRATEGY CLASSES
+# ==========================================
+
+class BaseStrategy:
+    def process(self, chunk, sr, current_time):
+        raise NotImplementedError
+
+
+class SilenceStrategy(BaseStrategy):
+    """
+    Tracks RMS energy. If energy stays below floor for 'limit' seconds
+    after 'warmup', it triggers a drop.
+    """
+    def __init__(self,
+                 warmup=SILENCE_WARMUP,
+                 silence_thresh=SILENCE_THRESHOLD,
+                 energy_floor=SILENCE_ENERGY_FLOOR):
+        self.warmup = warmup
+        self.limit = silence_thresh
+        self.floor = energy_floor
+        self.counter = 0.0
+
+    def process(self, chunk, sr, current_time):
+        if current_time < self.warmup:
+            self.counter = 0.0
+            return False, None
+
+        rms = float(np.sqrt(np.mean(chunk.astype(float) ** 2)))
+        chunk_sec = len(chunk) / sr
+
+        if rms < self.floor:
+            self.counter += chunk_sec
+        else:
+            self.counter = 0.0
+
+        if self.counter >= self.limit:
+            return True, f"Silence Timeout ({self.limit:.2f}s)"
+        return False, None
+
+
+class BeepStrategy(BaseStrategy):
+    """
+    Uses FFT to find dominant frequency. If the loudest frequency is
+    within [target_freq - tol, target_freq + tol] for >= min_dur, triggers.
+    """
+    def __init__(self,
+                 target_freq=BEEP_TARGET_FREQ,
+                 tolerance=BEEP_TOLERANCE,
+                 min_dur=BEEP_MIN_DURATION,
+                 min_amp=BEEP_MIN_AMP):
+        self.freq_min = target_freq - tolerance
+        self.freq_max = target_freq + tolerance
+        self.min_dur = min_dur
+        self.min_amp = min_amp
+        self.counter = 0.0
+
+    def process(self, chunk, sr, current_time):
+        chunk_float = chunk.astype(float)
+        spectrum = np.fft.rfft(chunk_float)
+        freqs = np.fft.rfftfreq(len(chunk_float), 1.0 / sr)
+        mags = np.abs(spectrum)
+
+        peak_idx = int(np.argmax(mags))
+        peak_freq = float(freqs[peak_idx])
+        peak_amp = float(mags[peak_idx])
+        chunk_sec = len(chunk_float) / sr
+
+        is_match = (peak_amp > self.min_amp) and (self.freq_min <= peak_freq <= self.freq_max)
+
+        if is_match:
+            self.counter += chunk_sec
+        else:
+            self.counter = 0.0
+
+        if self.counter >= self.min_dur:
+            return True, f"Beep Detected (~{peak_freq:.0f}Hz)"
+        return False, None
+
+
+class CombinedStrategy(BaseStrategy):
+    """
+    Parallel beep + silence.
+    Priority:
+      1. Beep detection (fast lane)
+      2. Silence detection (fallback)
+    """
+    def __init__(self,
+                 warmup=SILENCE_WARMUP,
+                 silence_thresh=SILENCE_THRESHOLD,
+                 target_freq=BEEP_TARGET_FREQ,
+                 tolerance=BEEP_TOLERANCE,
+                 min_dur=BEEP_MIN_DURATION,
+                 energy_floor=SILENCE_ENERGY_FLOOR,
+                 min_amp=BEEP_MIN_AMP):
+        self.silence_engine = SilenceStrategy(
+            warmup=warmup,
+            silence_thresh=silence_thresh,
+            energy_floor=energy_floor
+        )
+        self.beep_engine = BeepStrategy(
+            target_freq=target_freq,
+            tolerance=tolerance,
+            min_dur=min_dur,
+            min_amp=min_amp
+        )
+
+    def process(self, chunk, sr, current_time):
+        # 1. Beep (priority)
+        drop_beep, reason_beep = self.beep_engine.process(chunk, sr, current_time)
+        if drop_beep:
+            # Tag with type for clearer logs
+            return True, f"[BEEP] {reason_beep}"
+
+        # 2. Silence (fallback)
+        drop_silence, reason_silence = self.silence_engine.process(chunk, sr, current_time)
+        if drop_silence:
+            return True, f"[SILENCE] {reason_silence}"
+
+        return False, None
+
+# ==========================================
+# 3. DEEPGRAM-AWARE WRAPPER
+# ==========================================
 
 class StreamingVoicemailDropper:
-    def __init__(self, api_key):
+    """
+    Uses the same DSP strategies as the Streamlit version to decide drop time
+    while streaming each file in small chunks. Deepgram is used optionally for
+    transcript annotation (word count + transcript snippet).
+    """
+    def __init__(self, api_key, strategy_mode=DEFAULT_STRATEGY):
         self.dg_client = DeepgramClient(api_key=api_key)
-        self.audio_dir = "./voicemail_audio_files"
-        self.min_silence = 2.0
+        self.audio_dir = AUDIO_DIR
+        self.strategy_mode = strategy_mode
 
-    # ===== DETECTION METHODS =====
+    def _build_engine(self):
+        if self.strategy_mode == "silence":
+            return SilenceStrategy()
+        elif self.strategy_mode == "beep":
+            return BeepStrategy()
+        else:
+            return CombinedStrategy()
 
-    def detect_end_phrases(self, text):
-        """Detect end phrases"""
-        phrases = ['beep', 'tone', 'message', 'leave', 'recording', 'after the']
-        text_lower = text.lower()
-        for phrase in phrases:
-            if phrase in text_lower:
-                return True, f"[PHRASE:'{phrase.upper()}']"
-        return False, ""
-
-    def detect_long_silence(self, words):
-        """2s silence check"""
-        if len(words) < 2:
-            return False, 0, ""
-
-        # Check for gaps between consecutive words
-        for i in range(len(words) - 1):
-            word_end = getattr(words[i], 'end', 0)
-            next_word_start = getattr(words[i + 1], 'start', 0)
-            gap = next_word_start - word_end
-
-            if gap > self.min_silence:
-                return True, word_end, "[SILENCE]"
-
-        return False, 0, ""
-
-    def detect_beep_in_transcript(self, words):
-        """Detect if 'beep' mentioned and get its timing"""
-        for i, word in enumerate(words):
-            word_text = getattr(word, 'word', '')
-            if 'beep' in word_text.lower():
-                # Return time right after beep word
-                return True, getattr(word, 'end', 0), "[BEEP]"
-        return False, 0, ""
-
-    def detect_pure_noise_end(self, filepath):
-        """Pure noise - find silence start using RMS analysis"""
+    def _get_duration(self, filepath):
         try:
-            audio, sr = sf.read(filepath)
-            window_size = int(0.5 * sr)
-
-            rms_energies = []
-            for i in range(0, len(audio) - window_size, window_size // 4):
-                window = audio[i:i + window_size]
-                rms = np.sqrt(np.mean(window ** 2))
-                rms_energies.append(rms)
-
-            if not rms_energies:
-                return 3.0
-
-            avg_noise = np.mean(rms_energies)
-            silence_threshold = avg_noise * 0.3
-
-            for i, rms in enumerate(rms_energies):
-                if rms < silence_threshold:
-                    return max(i * (window_size / 4) / sr, 2.0)
-
-            return 3.0  # Fallback
+            with sf.SoundFile(filepath) as f:
+                return len(f) / f.samplerate
         except Exception:
-            return 3.0
+            return 0.0
 
-    def make_decision(self, transcript_result, filepath):
-        """6-Tier Decision Engine"""
-
-        if not transcript_result or not hasattr(transcript_result, 'results'):
-            # No transcription - pure noise
-            drop_time = self.detect_pure_noise_end(filepath)
-            return drop_time, "[NOISE]", 0, ""
-
-        # Get channel data
-        channels = transcript_result.results.channels
-        if not channels or len(channels) == 0:
-            drop_time = self.detect_pure_noise_end(filepath)
-            return drop_time, "[NOISE]", 0, ""
-
-        alternatives = channels[0].alternatives
-        if not alternatives or len(alternatives) == 0:
-            drop_time = self.detect_pure_noise_end(filepath)
-            return drop_time, "[NOISE]", 0, ""
-
-        alternative = alternatives[0]
-        full_transcript = alternative.transcript if hasattr(alternative, 'transcript') else ""
-        words = alternative.words if hasattr(alternative, 'words') else []
-
-        word_count = len(words)
-
-        if word_count == 0:
-            # No words detected - pure noise
-            drop_time = self.detect_pure_noise_end(filepath)
-            return drop_time, "[NOISE]", 0, ""
-
-        # PRIORITY 1: BEEP DETECTION
-        beep_detected, beep_time, reason = self.detect_beep_in_transcript(words)
-        if beep_detected:
-            return beep_time, reason, word_count, full_transcript
-
-        # PRIORITY 2: END PHRASES
-        end_phrase, reason = self.detect_end_phrases(full_transcript)
-        if end_phrase:
-            # Use time of last word
-            last_word_end = getattr(words[-1], 'end', 3.0)
-            return last_word_end, reason, word_count, full_transcript
-
-        # PRIORITY 3: LONG SILENCE (>2s)
-        silence_detected, silence_time, reason = self.detect_long_silence(words)
-        if silence_detected:
-            return silence_time, reason, word_count, full_transcript
-
-        # PRIORITY 4: SHORT SPEECH (greeting ends quickly)
-        if words and len(words) > 0:
-            last_word_end = getattr(words[-1], 'end', 0)
-            duration = last_word_end
-
-            if duration < 5.0:  # Short greeting
-                return min(last_word_end + 1.0, duration + 0.5), "[SHORT]", word_count, full_transcript
-
-        # PRIORITY 5: FALLBACK - use last word time + buffer
-        last_word_end = getattr(words[-1], 'end', 3.0) if words else 3.0
-        return min(last_word_end, 3.0), "[FALLBACK]", word_count, full_transcript
-
-    async def process_audio_file(self, filename):
-        """Process audio file using Deepgram transcription"""
-        filepath = os.path.join(self.audio_dir, filename)
-
-        print(f"\n[CALL] {filename}")
-
+    def transcribe_file(self, filepath):
+        """
+        Optional STT pass for annotation.
+        """
         try:
-            # Read audio file
-            with open(filepath, 'rb') as audio:
+            with open(filepath, "rb") as audio:
                 audio_data = audio.read()
 
-            # Synchronous transcription with word-level timestamps
             response = self.dg_client.listen.v1.media.transcribe_file(
                 request=audio_data,
                 model="nova-2",
@@ -156,100 +252,146 @@ class StreamingVoicemailDropper:
                 punctuate=True,
                 utterances=True
             )
+            return response
+        except Exception:
+            return None
 
-            # Make decision based on transcription
-            drop_time, method, word_count, transcript = self.make_decision(response, filepath)
+    async def process_audio_file(self, filename):
+        """
+        Core streaming logic:
+          - Stream file in CHUNK_DURATION_MS chunks
+          - Run selected DSP strategy on each chunk
+          - Stop and record drop_time & reason at first trigger
+        """
+        filepath = os.path.join(self.audio_dir, filename)
+        print(f"\n[CALL] {filename}")
 
-            print(f"[DROP] at {drop_time:.2f}s - {method} ({word_count} words)")
-
+        if not os.path.isfile(filepath):
+            print(f"[ERROR] File not found: {filepath}")
             return {
-                'filename': filename,
-                'drop_time': drop_time,
-                'method': method,
-                'words': word_count,
-                'transcript': transcript[:50] + "..." if len(transcript) > 50 else transcript
+                "filename": filename,
+                "drop_time": 0.0,
+                "method": "[MISSING]",
+                "words": 0,
+                "transcript": ""
             }
 
-        except Exception as e:
-            print(f"[ERROR] {str(e)}")
-            # Fallback to noise detection
-            drop_time = self.detect_pure_noise_end(filepath)
-            return {
-                'filename': filename,
-                'drop_time': drop_time,
-                'method': "[NOISE]",
-                'words': 0,
-                'transcript': f"Error: {str(e)}"
-            }
+        duration = self._get_duration(filepath)
+        engine = self._build_engine()
 
+        drop_time = None
+        drop_reason = "[NO_TRIGGER]"
+
+        # --- STREAM LOOP (DSP-BASED DECISION) ---
+        for chunk, sr, cur_time in stream_audio_file(filepath, CHUNK_DURATION_MS):
+            should_drop, reason = engine.process(chunk, sr, cur_time)
+            if should_drop:
+                drop_time = cur_time
+                drop_reason = reason or "[UNKNOWN]"
+                break
+
+        if drop_time is None:
+            drop_time = max(duration, 0.0)
+            drop_reason = "[NO_TRIGGER_FALLBACK]"
+
+        # --- OPTIONAL: STT PASS (ANNOTATION / DEBUG) ---
+        transcript_result = self.transcribe_file(filepath)
+        full_transcript = ""
+        word_count = 0
+
+        if transcript_result and hasattr(transcript_result, "results"):
+            channels = transcript_result.results.channels or []
+            if channels:
+                alternatives = channels[0].alternatives or []
+                if alternatives:
+                    alt = alternatives[0]
+                    full_transcript = getattr(alt, "transcript", "") or ""
+                    words = getattr(alt, "words", []) or []
+                    word_count = len(words)
+
+        # Detailed per-file log includes which path fired
+        print(f"[DROP] at {drop_time:.2f}s - {drop_reason} ({word_count} words)")
+
+        return {
+            "filename": filename,
+            "drop_time": drop_time,
+            "method": drop_reason,
+            "words": word_count,
+            "transcript": (
+                full_transcript[:50] + "..." if len(full_transcript) > 50 else full_transcript
+            ),
+        }
+
+
+# ==========================================
+# 4. MAIN / CLI TABLE
+# ==========================================
 
 async def main():
-    # Get API key from environment
-    API_KEY = os.getenv("DEEPGRAM_API_KEY")
-
-    if not API_KEY:
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
         print("[ERROR] DEEPGRAM_API_KEY not found in .env file")
         return
 
-    dropper = StreamingVoicemailDropper(API_KEY)
+    dropper = StreamingVoicemailDropper(api_key=api_key, strategy_mode=DEFAULT_STRATEGY)
 
-    # Get audio files
-    audio_dir = "./voicemail_audio_files"
-    if not os.path.exists(audio_dir):
-        print(f"[ERROR] Directory '{audio_dir}' not found")
+    if not os.path.isdir(AUDIO_DIR):
+        print(f"[ERROR] Directory '{AUDIO_DIR}' not found")
         return
 
-    files = os.listdir(audio_dir)
-    audio_files = sorted([f for f in files if f.endswith('.wav')])
-
-    if not audio_files:
-        print(f"[ERROR] No .wav files found in '{audio_dir}'")
+    files = sorted(f for f in os.listdir(AUDIO_DIR) if f.lower().endswith(".wav"))
+    if not files:
+        print(f"[ERROR] No .wav files found in '{AUDIO_DIR}'")
         return
 
-    print(f"\n>> Starting Streaming Voicemail Dropper")
-    print(f">> Found {len(audio_files)} audio files\n")
+    print(f"\n>> Streaming Voicemail Dropper (Strategy: {DEFAULT_STRATEGY.upper()})")
+    print(f">> Found {len(files)} audio files\n")
     print("=" * 80)
 
     results = []
-    for filename in audio_files:
+    for filename in files:
         try:
             result = await dropper.process_audio_file(filename)
             results.append(result)
         except Exception as e:
             print(f"\n[ERROR] {filename}: {str(e)}")
             results.append({
-                'filename': filename,
-                'drop_time': 3.0,
-                'method': '[ERROR]',
-                'words': 0,
-                'transcript': str(e)
+                "filename": filename,
+                "drop_time": 3.0,
+                "method": "[ERROR]",
+                "words": 0,
+                "transcript": str(e),
             })
 
-    # RESULTS TABLE (Submission Ready)
+    # RESULTS TABLE
     print("\n" + "=" * 80)
     print("FINAL STREAMING RESULTS")
     print("=" * 80)
-    print(f"| {'File':<18} | {'Drop Time':>9} | {'Method':<15} | {'Words':>5} |")
+    print(f"| {'File':<24} | {'Drop Time':>9} | {'Method':<25} | {'Words':>5} |")
     print("|" + "-" * 78 + "|")
 
     for r in results:
-        print(f"| {r['filename']:<18} | {r['drop_time']:>8.2f}s | {r['method']:<15} | {r['words']:>5} |")
+        print(
+            f"| {r['filename']:<24} | {r['drop_time']:>8.2f}s | "
+            f"{r['method']:<25} | {r['words']:>5} |"
+        )
 
     print("=" * 80)
 
-    # Summary statistics
-    avg_drop_time = sum(r['drop_time'] for r in results) / len(results) if results else 0
-    total_words = sum(r['words'] for r in results)
+    if results:
+        avg_drop_time = sum(r["drop_time"] for r in results) / len(results)
+        total_words = sum(r["words"] for r in results)
+    else:
+        avg_drop_time = 0.0
+        total_words = 0
 
     print(f"\nSUMMARY:")
+    print(f"   * Strategy mode: {DEFAULT_STRATEGY}")
     print(f"   * Average drop time: {avg_drop_time:.2f}s")
     print(f"   * Total words transcribed: {total_words}")
-    print(f"   * Files processed: {len(results)}/{len(audio_files)}")
-    print("\n[SUCCESS] Production streaming voicemail dropper using Deepgram Live WebSocket.")
-    print("   Processes 500ms chunks exactly like phone calls. 6-tier decision engine")
-    print("   handles ALL cases: beep detection, end phrases, silence gaps, pure noise")
-    print("   (RMS analysis), short greetings. Early decisions during stream with")
-    print("   word-level timestamps ensure 100% compliance.\n")
+    print(f"   * Files processed: {len(results)}/{len(files)}")
+    print("\n[SUCCESS] DSP-based streaming voicemail dropper (beep + silence) "
+          "with optional Deepgram transcript annotation.\n")
 
 
 if __name__ == "__main__":
