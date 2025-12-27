@@ -1,29 +1,3 @@
-"""
-Streaming Voicemail Dropper
-
-This solution simulates real phone calls by streaming each voicemail audio file
-in fixed 50 ms chunks. A hybrid detection engine runs on each chunk:
-
-1. Beep detection (fast lane): Uses FFT to detect a sustained tone around a
-   configurable frequency band (e.g., 800 Hz +/- tolerance) with a minimum
-   duration and amplitude.
-2. Silence detection (fallback): Computes RMS energy and, after a warmup
-   period, looks for a continuous region of low energy (silence) longer than
-   a configurable threshold.
-
-If a beep is detected, the drop time is set to the moment the beep is
-confirmed. If no beep is found, the system falls back to silence detection
-and triggers after the greeting ends and the caller stops speaking. The engine
-stops at the first trigger and returns the timestamp and trigger reason
-(Beep Detected / Silence Timeout / Fallback). Optionally, the script uses
-Deepgram speech-to-text to annotate the result with a transcript and word
-count for analysis.
-
-A separate Streamlit app (not in this file) uses the same detection logic
-to provide an interactive demo with sliders to tune parameters and visualize
-the waveform, warmup region, and drop point.
-"""
-
 import asyncio
 import os
 import wave
