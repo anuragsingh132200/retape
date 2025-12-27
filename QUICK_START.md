@@ -1,92 +1,114 @@
 # Quick Start Guide
 
-## Installation
+Get up and running in 3 simple steps!
 
-1. Install dependencies:
+## Step 1: Install Dependencies
+
+**Windows:**
+```bash
+setup.bat
+```
+
+**Linux/Mac:**
+```bash
+chmod +x setup.sh
+./setup.sh
+```
+
+**Manual:**
 ```bash
 pip install -r requirements.txt
 ```
 
-2. The API key is already configured in `.env.example` and copied to `.env`
+## Step 2: Configure API Keys (Optional)
 
-## Running the Demo
+Edit `.env` file:
+```env
+DEEPGRAM_API_KEY=your_key_here
+GEMINI_API_KEY=your_key_here
+```
 
-### Option 1: Full Demo (All 7 Files)
+**Note**: System works without API keys using fallback methods!
+
+## Step 3: Run Demo
+
+**Windows:**
 ```bash
-python demo.py
+run_demo.bat
 ```
 
-This will:
-- Process all 7 voicemail audio files
-- Display detailed analysis for each
-- Save results to `results/analysis_results.json`
-- Save simple timestamps to `results/timestamps.txt`
-
-### Option 2: Quick Test (Single File)
+**Linux/Mac:**
 ```bash
-python test_single.py
+chmod +x run_demo.sh
+./run_demo.sh
 ```
 
-This will:
-- Test the system on just the first audio file
-- Show that the detector is working correctly
-
-## What to Expect
-
-The system will:
-1. Load each audio file
-2. Detect beeps using frequency analysis
-3. Identify voice activity segments
-4. (Optional) Use Gemini AI for additional analysis
-5. Calculate the optimal timestamp to start the compliance message
-
-## Sample Output
-
-```
-============================================================
-Processing: vm1_output.wav
-============================================================
-Duration: 16.90 seconds
-[+] Beep detected at: 1.70s
-Voice segments detected: 20
-  Segment 1: 3.22s - 3.43s
-  Segment 2: 3.48s - 3.97s
-  Segment 3: 4.04s - 4.16s
-
-------------------------------------------------------------
-RECOMMENDED DROP TIMESTAMP: 1.80s
-------------------------------------------------------------
-
-Reasoning: Beep detected at 1.70s. Starting message at 1.80s
-(immediately after beep) ensures consumer hears complete
-compliance message.
+**Direct:**
+```bash
+python voicemail_drop.py
 ```
 
-## Understanding the Results
+## That's it! 🎉
 
-- **Beep Detected**: System found a voicemail beep (most reliable signal)
-- **Voice Segments**: Shows when speech was detected in the audio
-- **Recommended Timestamp**: The exact moment to start playing the compliance message
-- **Reasoning**: Explanation of why this timestamp was chosen
+Results will be saved to `results.json`
 
-## Files Generated
+## Test Single File
 
-After running the demo, check the `results/` directory:
+```bash
+python test_single.py "Voicemails - SWE Intern/vm1_output.wav"
+```
 
-- `analysis_results.json`: Detailed analysis with all data points
-- `timestamps.txt`: Simple list of recommended timestamps
+## View Results
 
-## Troubleshooting
+```bash
+cat results.json
+```
 
-### LLM Rate Limit Errors
-If you see Gemini API rate limit errors, don't worry! The system works perfectly without LLM analysis using signal processing alone. The LLM is just an additional validation layer.
+## Expected Output
 
-### No Audio Files Found
-Make sure the audio files are in the `Voicemails - SWE Intern/` directory.
+```json
+{
+  "vm1_output.wav": {
+    "drop_timestamp": 10.84,
+    "reason": "end_of_file",
+    "confidence": 1.0,
+    "method_used": ["beep"],
+    "compliance_status": "safe"
+  }
+}
+```
 
-### Module Not Found Errors
-Run `pip install -r requirements.txt` to install all dependencies.
+## Need Help?
 
-## Next Steps
+- 📖 Full documentation: [README.md](README.md)
+- 🎥 Demo guide: [DEMO_GUIDE.md](DEMO_GUIDE.md)
+- 📊 Technical summary: [SUBMISSION_SUMMARY.md](SUBMISSION_SUMMARY.md)
 
-Read [SOLUTION_EXPLANATION.md](SOLUTION_EXPLANATION.md) for a deep dive into how the system works and the reasoning behind the implementation.
+## System Requirements
+
+- Python 3.8 or higher
+- 2GB RAM minimum
+- Internet connection for API calls (optional)
+
+## Project Structure
+
+```
+retape/
+├── voicemail_drop.py       # Main system
+├── results.json            # Output
+├── requirements.txt        # Dependencies
+├── .env                    # API keys
+└── Voicemails - SWE Intern/ # Audio files
+```
+
+## Common Issues
+
+**Import Error?** → Run `pip install -r requirements.txt`
+
+**VAD Warnings?** → Expected! System uses RMS fallback
+
+**No Results?** → Check audio files are in `Voicemails - SWE Intern/`
+
+---
+
+**Ready to impress? Run the demo now!** 🚀

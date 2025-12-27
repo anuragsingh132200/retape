@@ -1,14 +1,8 @@
 {
   "permissions": {
     "allow": [
-      "Bash(copy:*)",
-      "Bash(pip install:*)",
-      "Bash(python -m pip install:*)",
-      "Bash(python test_single.py:*)",
-      "Bash(python demo.py:*)",
-      "Bash(tee:*)",
-      "Bash(ls:*)",
-      "Bash(find:*)"
+      "Bash(dir:*)",
+      "Bash(python:*)"
     ]
   }
 }

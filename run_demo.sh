@@ -1,18 +1,14 @@
 #!/bin/bash
 
 echo "============================================================"
-echo "Voicemail Drop Detection System - Setup"
+echo "Voicemail Drop Detection System - Demo"
 echo "============================================================"
 echo ""
 
-echo "Installing Python dependencies..."
-pip install -r requirements.txt
+echo "Running detection on all voicemail files..."
+python voicemail_drop.py
 
 echo ""
 echo "============================================================"
-echo "Setup complete!"
-echo ""
-echo "Next steps:"
-echo "1. Edit .env file with your API keys"
-echo "2. Run: python voicemail_drop.py"
+echo "Demo complete! Check results.json for output."
 echo "============================================================"

@@ -1,51 +1,40 @@
 #!/usr/bin/env python3
 """
-Quick test script to verify the system works on a single audio file
+Quick test script to process a single voicemail file
+Usage: python test_single.py <filename>
 """
 
-from pathlib import Path
-from voicemail_detector import VoicemailDetector
+import asyncio
+import sys
+from voicemail_drop import VoicemailDropDetector
 
+async def test_single_file(filename):
+    """Test a single voicemail file"""
+    detector = VoicemailDropDetector()
 
-def main():
-    print("\n" + "="*60)
-    print(" Testing Voicemail Detector ")
-    print("="*60 + "\n")
+    print(f"\nProcessing: {filename}")
+    print("=" * 60)
 
-    # Initialize detector
-    try:
-        detector = VoicemailDetector()
-        print("[OK] VoicemailDetector initialized successfully")
-    except ValueError as e:
-        print(f"[ERROR] {e}")
-        return
+    result = await detector.process_file(filename)
 
-    # Test on first audio file
-    audio_dir = Path("Voicemails - SWE Intern")
-    audio_files = sorted(audio_dir.glob("*.wav"))
+    print("\n" + "=" * 60)
+    print("RESULT:")
+    print(f"  Drop Timestamp: {result.drop_timestamp}s")
+    print(f"  Reason: {result.reason}")
+    print(f"  Confidence: {result.confidence}")
+    print(f"  Methods Used: {', '.join(result.method_used)}")
+    print(f"  Compliance: {result.compliance_status}")
+    if result.details:
+        print(f"  Details: {result.details}")
+    print("=" * 60 + "\n")
 
-    if not audio_files:
-        print("[ERROR] No audio files found")
-        return
-
-    print(f"[OK] Found {len(audio_files)} audio files")
-    print(f"\nTesting with: {audio_files[0].name}\n")
-
-    # Process single file
-    result = detector.process_voicemail(str(audio_files[0]), verbose=True)
-
-    print("\n" + "="*60)
-    print(" Test Complete ")
-    print("="*60)
-    print(f"\nRecommended timestamp: {result['recommended_timestamp']:.2f}s")
-    print(f"File duration: {result['duration']:.2f}s")
-    print(f"Beep detected: {'Yes' if result['beep_detected'] else 'No'}")
-
-    if result['beep_detected']:
-        print(f"Beep at: {result['beep_timestamp']:.2f}s")
-
-    print("\n[OK] System is working correctly!\n")
-
+    return result
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) < 2:
+        print("Usage: python test_single.py <filename>")
+        print("Example: python test_single.py 'Voicemails - SWE Intern/vm1_output.wav'")
+        sys.exit(1)
+
+    filename = sys.argv[1]
+    asyncio.run(test_single_file(filename))
